@@ -78,3 +78,29 @@ fn test_skip_comments() {
     assert_eq!(lexer.next_token(), Token::Keyword("int".to_string()));
     assert_eq!(lexer.next_token(), Token::EOF);
 }
+#[test]
+fn test_unknown_character() {
+    let mut lexer = Lexer::new("@");
+    assert_eq!(lexer.next_token(), Token::Unknown('@'));
+    assert_eq!(lexer.next_token(), Token::EOF);
+}
+#[test]
+fn test_tokenize_full_line() {
+    let mut lexer = Lexer::new("int main() { return 42; }");
+    let tokens = lexer.tokenize();
+    let expected = vec![
+        Token::Keyword("int".to_string()),
+        Token::Id("main".to_string()),                   
+        Token::Operator("(".to_string()),
+        Token::Operator(")".to_string()),
+        Token::Operator("{".to_string()),
+        Token::Keyword("return".to_string()),
+        Token::Num(42),
+        Token::Operator(";".to_string()),
+        Token::Operator("}".to_string()),
+        Token::EOF,
+    ];
+    assert_eq!(tokens, expected);
+}
+
+

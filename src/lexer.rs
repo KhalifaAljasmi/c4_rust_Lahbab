@@ -66,7 +66,7 @@ impl Lexer {
                             "char" | "else" | "enum" | "if" | "int" | "return" |
                             "sizeof" | "while" | "open" | "read" | "close" | 
                             "printf" | "malloc" | "free" | "memset" | "memcmp" | 
-                            "exit" | "void" | "main" => Token::Keyword(ident),
+                            "exit" | "void"  => Token::Keyword(ident),
                             _ => Token::Id(ident),
                         }
                     }
@@ -273,5 +273,20 @@ impl Lexer {
         }
 
         Token::Unknown('"') // unterminated string
+    }
+    /// Tokenizes the entire input and returns a vector of tokens.
+    pub fn tokenize(&mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+
+        loop {
+            let token = self.next_token();
+            if token == Token::EOF {
+                tokens.push(Token::EOF);
+                break;
+            }
+            tokens.push(token);
+        }
+
+        tokens
     }
 }
