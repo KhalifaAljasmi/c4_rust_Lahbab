@@ -112,34 +112,52 @@ impl Parser {
     }
 
     fn parse_function(&mut self) -> ParseResult<ASTNode> {
+        // int
         self.expect_keyword("int")?;
+
+        // function name
         let name = match self.next_token() {
             Token::Id(s) => s,
-            t => return Err(ParseError::UnexpectedToken(t, "function name".into())),
+            other => return Err(ParseError::UnexpectedToken(other, "function name".into())),
         };
 
+        // (
         self.expect_op("(")?;
         let mut params = Vec::new();
-        while self.peek() != Token::Operator(")".into()) {
-            if self.peek() == Token::Operator("{".into()) {
-                return Err(ParseError::MissingParenthesis);
-            }
-            if let Token::Id(p) = self.next_token() {
-                params.push(p);
+
+        // only parse params if we're not immediately at ')'
+        if self.peek() != Token::Operator(")".into()) {
+            loop {
+                // missing the closing ')'?
+                if self.peek() == Token::Operator("{".into()) {
+                    return Err(ParseError::MissingParenthesis);
+                }
+
+                // must be an identifier
+                match self.next_token() {
+                    Token::Id(p) => params.push(p),
+                    _ => return Err(ParseError::MissingParenthesis),
+                }
+
+                // comma → another param, otherwise end of list
                 if self.peek() == Token::Operator(",".into()) {
                     self.next_token();
+                    continue;
                 }
-            } else {
-                return Err(ParseError::MissingParenthesis);
+                break;
             }
         }
+
+        // )
         self.expect_op(")")?;
 
+        // {
         self.expect_op("{")?;
         let mut body = Vec::new();
         while self.peek() != Token::Operator("}".into()) {
             body.push(self.parse_statement()?);
         }
+        // }
         self.expect_op("}")?;
 
         Ok(ASTNode::Function { name, params, body })
