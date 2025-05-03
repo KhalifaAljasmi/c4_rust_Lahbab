@@ -64,7 +64,7 @@ impl Lexer {
                         match ident.as_str() {
                             // Check if it's a known keyword
                             "char" | "else" | "enum" | "if" | "int" | "return" |
-                            "sizeof" | "while" | "open" | "read" | "close" | 
+                            "sizeof" | "while" | "for" | "open" | "read" | "close" | 
                             "printf" | "malloc" | "free" | "memset" | "memcmp" | 
                             "exit" | "void"  => Token::Keyword(ident),
                             _ => Token::Id(ident),
