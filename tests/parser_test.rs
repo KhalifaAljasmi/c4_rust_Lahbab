@@ -194,7 +194,7 @@ fn parse_ternary_operator() {
 
 #[test]
 fn error_on_missing_return_semicolon() {
-    let src = "int main() { return 5 }";  // missing `;`
+    let src = "int main() { return 5 }";  // missing ;
     let tokens = Lexer::new(src).tokenize();
     let mut p = Parser::new(tokens);
     let err = p.parse_program().unwrap_err();

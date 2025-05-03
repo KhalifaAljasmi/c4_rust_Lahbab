@@ -2,5 +2,5 @@
 name = "c4_rust_lahbab"
 version = "0.1.0"
 edition = "2021"
-
+path = "src/lib.rs"
 [dependencies]
