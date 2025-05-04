@@ -1,4 +1,6 @@
 // Modified parser.rs with fixes for control flow parsing
+#![allow(dead_code)]  // Add this line to suppress warnings about unused code
+
 use crate::lexer::Token;
 use std::fmt;
 
@@ -7,11 +9,11 @@ pub enum ASTNode {
     Program(Vec<ASTNode>),
     Function {
         name: String,
-        params: Vec<(String, String)>, // Changed to (type, name)
+        params: Vec<String>, // Changed back to simple strings
         body: Vec<ASTNode>,
     },
     Return(Box<ASTNode>),
-    Number(i64),
+    Number(i32),
     Identifier(String),
     Assignment {
         name: String,
@@ -53,6 +55,30 @@ pub enum ASTNode {
     },
     CharLiteral(char),
     StringLiteral(String),
+    // Support Expr compatibility
+    Expression(Box<Expr>),
+    // Add this new variant for variable declarations:
+    VariableDeclaration {
+        var_type: String,
+        name: String,
+        initializer: Option<Box<ASTNode>>,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Expr {
+    Number(i32),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Mod(Box<Expr>, Box<Expr>),
+    Equal(Box<Expr>, Box<Expr>),
+    Less(Box<Expr>, Box<Expr>),
+    Greater(Box<Expr>, Box<Expr>),
+    Variable(String),
+    Var(String),  // Alias for Variable that appears in the codebase
+    Call(String, Vec<Expr>),
 }
 
 #[derive(Debug)]
@@ -132,7 +158,7 @@ impl Parser {
         let mut params = Vec::new();
         if self.peek() != Token::Operator(")".into()) {
             loop {
-                let param_type = match self.next_token() {
+                let _param_type = match self.next_token() {
                     Token::Keyword(s) => s,
                     t => return Err(ParseError::UnexpectedToken(t, "parameter type".to_string())),
                 };
@@ -140,7 +166,7 @@ impl Parser {
                     Token::Id(s) => s,
                     t => return Err(ParseError::UnexpectedToken(t, "parameter name".to_string())),
                 };
-                params.push((param_type, param_name));
+                params.push(param_name); // Just store the name, not the type
                 if self.peek() != Token::Operator(",".into()) {
                     break;
                 }
@@ -185,6 +211,10 @@ impl Parser {
             Token::Keyword(ref k) if k == "for" => {
                 self.parse_for_statement()
             },
+            // Add this new case to handle variable declarations:
+            Token::Keyword(ref k) if k == "int" || k == "char" => {
+                self.parse_variable_declaration()
+            },
             Token::Operator(ref o) if o == "{" => self.parse_block(),
             _ => {
                 let expr = self.parse_expr()?;
@@ -197,6 +227,41 @@ impl Parser {
                 Ok(expr)
             }
         }
+    }
+    
+    // Add this new method to parse variable declarations:
+    fn parse_variable_declaration(&mut self) -> ParseResult<ASTNode> {
+        // Parse the type (int or char)
+        let var_type = match self.next_token() {
+            Token::Keyword(k) => k,
+            t => return Err(ParseError::UnexpectedToken(t, "int or char".to_string())),
+        };
+        
+        // Parse the variable name
+        let name = match self.next_token() {
+            Token::Id(name) => name,
+            t => return Err(ParseError::UnexpectedToken(t, "identifier".to_string())),
+        };
+        
+        // Check for initialization
+        let initializer = if self.peek() == Token::Operator("=".into()) {
+            self.next_token(); // consume '='
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        
+        // Expect semicolon
+        if self.peek() != Token::Operator(";".into()) {
+            return Err(ParseError::MissingSemicolon);
+        }
+        self.next_token(); // consume ';'
+        
+        Ok(ASTNode::VariableDeclaration {
+            var_type,
+            name,
+            initializer,
+        })
     }
 
     // New dedicated method for parsing if statements
@@ -560,7 +625,7 @@ impl Parser {
 
     fn parse_primary(&mut self) -> ParseResult<ASTNode> {
         match self.next_token() {
-            Token::Num(n) => Ok(ASTNode::Number(n)),
+            Token::Num(n) => Ok(ASTNode::Number(n as i32)), // Convert i64 to i32
             Token::Id(name) => Ok(ASTNode::Identifier(name)),
             Token::CharLiteral(c) => Ok(ASTNode::CharLiteral(c)),
             Token::StringLiteral(s) => Ok(ASTNode::StringLiteral(s)),
@@ -604,6 +669,12 @@ impl Parser {
 
 // Modified parse_control_flow function
 pub fn parse_control_flow(tokens: Vec<Token>) -> Result<ASTNode, ParseError> {
+    let mut parser = Parser::new(tokens);
+    parser.parse_program()
+}
+
+// Add the parse function for the Program
+pub fn parse(tokens: Vec<crate::lexer::Token>) -> Result<ASTNode, ParseError> {
     let mut parser = Parser::new(tokens);
     parser.parse_program()
 }
