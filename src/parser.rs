@@ -1,299 +1,609 @@
-// src/parser.rs
-
+// Modified parser.rs with fixes for control flow parsing
 use crate::lexer::Token;
-use std::iter::Peekable;
-use std::slice::Iter;
+use std::fmt;
 
-/// Top‐level AST nodes (statements, functions, etc.)
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum ASTNode {
-    Return(Box<Expr>),
+    Program(Vec<ASTNode>),
+    Function {
+        name: String,
+        params: Vec<(String, String)>, // Changed to (type, name)
+        body: Vec<ASTNode>,
+    },
+    Return(Box<ASTNode>),
+    Number(i64),
+    Identifier(String),
+    Assignment {
+        name: String,
+        value: Box<ASTNode>,
+    },
+    UnaryOp {
+        op: String,
+        expr: Box<ASTNode>,
+    },
+    BinaryOp {
+        op: String,
+        left: Box<ASTNode>,
+        right: Box<ASTNode>,
+    },
     If {
-        condition: Box<Expr>,
+        condition: Box<ASTNode>,
         then_branch: Box<ASTNode>,
         else_branch: Option<Box<ASTNode>>,
     },
+    Block(Vec<ASTNode>),
+    Ternary {
+        cond: Box<ASTNode>,
+        then_expr: Box<ASTNode>,
+        else_expr: Box<ASTNode>,
+    },
     While {
-        condition: Box<Expr>,
+        condition: Box<ASTNode>,
         body: Box<ASTNode>,
     },
-    Sequence(Vec<ASTNode>),
-    Declaration(String, Box<Expr>),
-    Assignment(String, Box<Expr>),
-    FunctionDef {
+    For {
+        init: Option<Box<ASTNode>>,
+        condition: Option<Box<ASTNode>>,
+        update: Option<Box<ASTNode>>,
+        body: Box<ASTNode>,
+    },
+    Call {
         name: String,
-        params: Vec<String>,
-        body: Box<ASTNode>,
+        args: Vec<ASTNode>,
     },
-    Print(String),
+    CharLiteral(char),
+    StringLiteral(String),
 }
 
-/// Expression nodes
-#[derive(Debug, PartialEq)]
-pub enum Expr {
-    Number(i64),
-    Variable(String),
-    Var(String),
-    Add(Box<Expr>, Box<Expr>),
-    Sub(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
-    Div(Box<Expr>, Box<Expr>),
-    Mod(Box<Expr>, Box<Expr>),
-    Equal(Box<Expr>, Box<Expr>),
-    Less(Box<Expr>, Box<Expr>),
-    Greater(Box<Expr>, Box<Expr>),
-    Call(String, Vec<Expr>),
+#[derive(Debug)]
+pub enum ParseError {
+    UnexpectedToken(Token, String),
+    UnexpectedEOF(String),
+    InvalidAssignmentTarget,
+    InvalidParameter,
+    InvalidExpression,
+    MissingSemicolon,
+    MissingBrace,
+    MissingParenthesis,
 }
 
-/// Parse the entire token stream starting at `main`
-pub fn parse(tokens: &[Token]) -> ASTNode {
-    let mut iter = tokens.iter().peekable();
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::UnexpectedToken(t, expected) => 
+                write!(f, "ParseError: Unexpected token {:?}, expected {}", t, expected),
+            ParseError::UnexpectedEOF(expected) =>
+                write!(f, "ParseError: Unexpected EOF, expected {}", expected),
+            ParseError::InvalidAssignmentTarget =>
+                write!(f, "ParseError: Invalid assignment target"),
+            ParseError::InvalidParameter =>
+                write!(f, "ParseError: Invalid parameter"),
+            ParseError::InvalidExpression =>
+                write!(f, "ParseError: Invalid expression"),
+            ParseError::MissingSemicolon =>
+                write!(f, "ParseError: Missing semicolon"),
+            ParseError::MissingBrace =>
+                write!(f, "ParseError: Missing brace"),
+            ParseError::MissingParenthesis =>
+                write!(f, "ParseError: Missing parenthesis"),
+        }
+    }
+}
 
-    // Find `main` and consume up to its `{`
-    loop {
-        match iter.next() {
-            Some(Token::Identifier(n)) if n == "main" => {
-                while let Some(tok) = iter.next() {
-                    if *tok == Token::LBrace {
-                        break;
-                    }
+impl std::error::Error for ParseError {}
+
+type ParseResult<T> = std::result::Result<T, ParseError>;
+
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    pub fn parse_program(&mut self) -> ParseResult<ASTNode> {
+        let mut nodes = Vec::new();
+        while self.peek() != Token::EOF {
+            nodes.push(self.parse_function()?);
+        }
+        Ok(ASTNode::Program(nodes))
+    }
+
+    fn parse_function(&mut self) -> ParseResult<ASTNode> {
+        // Parse return type
+        self.expect_keyword("int")?;
+        // Parse function name
+        let name = match self.next_token() {
+            Token::Id(s) => s,
+            t => return Err(ParseError::UnexpectedToken(t, "function name".to_string())),
+        };
+        // Check for opening parenthesis
+        if self.next_token() != Token::Operator("(".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        // New Check: Detect missing closing ')' if next token is '{'
+        if self.peek() == Token::Operator("{".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        // Proceed with parsing parameters...
+        let mut params = Vec::new();
+        if self.peek() != Token::Operator(")".into()) {
+            loop {
+                let param_type = match self.next_token() {
+                    Token::Keyword(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t, "parameter type".to_string())),
+                };
+                let param_name = match self.next_token() {
+                    Token::Id(s) => s,
+                    t => return Err(ParseError::UnexpectedToken(t, "parameter name".to_string())),
+                };
+                params.push((param_type, param_name));
+                if self.peek() != Token::Operator(",".into()) {
+                    break;
                 }
-                break;
+                self.next_token();
             }
-            Some(_) => continue,
-            None => panic!("couldn't find 'main' in tokens"),
         }
+        // Check for closing parenthesis
+        if self.next_token() != Token::Operator(")".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        let body = self.parse_block()?;
+        Ok(ASTNode::Function { 
+            name, 
+            params, 
+            body: match body {
+                ASTNode::Block(stmts) => stmts,
+                _ => vec![body],
+            }
+        })
     }
-
-    // Collect statements until matching `}`
-    let mut stmts = Vec::new();
-    while let Some(tok) = iter.peek() {
-        match tok {
-            Token::Return
-            | Token::If
-            | Token::While
-            | Token::LBrace
-            | Token::Int
-            | Token::Identifier(_) => {
-                stmts.push(parse_stmt(&mut iter))
-            }
-            Token::RBrace => {
-                iter.next();
-                break;
-            }
-            other => panic!("Unexpected token in main: {:?}", other),
-        }
-    }
-
-    ASTNode::Sequence(stmts)
-}
-
-fn parse_stmt(iter: &mut Peekable<Iter<Token>>) -> ASTNode {
-    // handle printf("..."); first
-    if let Some(Token::Identifier(name)) = iter.peek() {
-        if name == "printf" {
-            iter.next();
-            expect_token(iter, Token::LParen);
-            let s = match iter.next() {
-                Some(Token::StringLiteral(s)) => s.clone(),
-                other => panic!("Expected string literal, got {:?}", other),
-            };
-            expect_token(iter, Token::RParen);
-            expect_token(iter, Token::Semicolon);
-            return ASTNode::Print(s);
-        }
-    }
-
-    match iter.peek() {
-        Some(Token::Return) => {
-            iter.next();
-            let e = parse_expr(iter);
-            expect_token(iter, Token::Semicolon);
-            ASTNode::Return(e)
-        }
-        Some(Token::If) => {
-            iter.next();
-            parse_if(iter)
-        }
-        Some(Token::While) => {
-            iter.next();
-            parse_while(iter)
-        }
-        Some(Token::LBrace) => parse_block(iter),
-        Some(Token::Int) => {
-            iter.next();
-            parse_declaration(iter)
-        }
-        Some(Token::Identifier(_)) => parse_assignment(iter),
-        other => panic!("Expected stmt, got {:?}", other),
-    }
-}
-
-fn parse_block(iter: &mut Peekable<Iter<Token>>) -> ASTNode {
-    expect_token(iter, Token::LBrace);
-    let mut stmts = Vec::new();
-    while let Some(tok) = iter.peek() {
-        match tok {
-            Token::RBrace => {
-                iter.next();
-                break;
-            }
-            Token::Return
-            | Token::If
-            | Token::While
-            | Token::LBrace
-            | Token::Int
-            | Token::Identifier(_) => {
-                stmts.push(parse_stmt(iter))
-            }
-            other => panic!("Bad token in block: {:?}", other),
-        }
-    }
-    ASTNode::Sequence(stmts)
-}
-
-fn parse_if(iter: &mut Peekable<Iter<Token>>) -> ASTNode {
-    expect_token(iter, Token::LParen);
-    let cond = parse_expr(iter);
-    expect_token(iter, Token::RParen);
-
-    let tb = parse_stmt(iter);
-    let eb = if let Some(Token::Else) = iter.peek() {
-        iter.next();
-        Some(Box::new(parse_stmt(iter)))
-    } else {
-        None
-    };
-
-    ASTNode::If {
-        condition: cond,
-        then_branch: Box::new(tb),
-        else_branch: eb,
-    }
-}
-
-fn parse_while(iter: &mut Peekable<Iter<Token>>) -> ASTNode {
-    expect_token(iter, Token::LParen);
-    let cond = parse_expr(iter);
-    expect_token(iter, Token::RParen);
-
-    let body = parse_stmt(iter);
-    ASTNode::While {
-        condition: cond,
-        body: Box::new(body),
-    }
-}
-
-fn parse_declaration(iter: &mut Peekable<Iter<Token>>) -> ASTNode {
-    let name = match iter.next() {
-        Some(Token::Identifier(n)) => n.clone(),
-        other => panic!("Expected identifier in decl, got {:?}", other),
-    };
-    expect_token(iter, Token::Assign);
-    let expr = parse_expr(iter);
-    expect_token(iter, Token::Semicolon);
-    ASTNode::Declaration(name, expr)
-}
-
-fn parse_assignment(iter: &mut Peekable<Iter<Token>>) -> ASTNode {
-    let name = match iter.next() {
-        Some(Token::Identifier(n)) => n.clone(),
-        other => panic!("Expected identifier in assign, got {:?}", other),
-    };
-    expect_token(iter, Token::Assign);
-    let expr = parse_expr(iter);
-    expect_token(iter, Token::Semicolon);
-    ASTNode::Assignment(name, expr)
-}
-
-fn parse_expr(iter: &mut Peekable<Iter<Token>>) -> Box<Expr> {
-    parse_add(iter)
-}
-
-fn parse_add(iter: &mut Peekable<Iter<Token>>) -> Box<Expr> {
-    let mut node = parse_term(iter);
-    while let Some(tok) = iter.peek() {
-        match tok {
-            Token::Plus => {
-                iter.next();
-                let rhs = parse_term(iter);
-                node = Box::new(Expr::Add(node, rhs));
-            }
-            Token::Minus => {
-                iter.next();
-                let rhs = parse_term(iter);
-                node = Box::new(Expr::Sub(node, rhs));
-            }
-            _ => break,
-        }
-    }
-    node
-}
-
-fn parse_term(iter: &mut Peekable<Iter<Token>>) -> Box<Expr> {
-    let mut node = parse_primary(iter);
-    while let Some(tok) = iter.peek() {
-        match tok {
-            Token::Star => {
-                iter.next();
-                let rhs = parse_primary(iter);
-                node = Box::new(Expr::Mul(node, rhs));
-            }
-            Token::Divide => {
-                iter.next();
-                let rhs = parse_primary(iter);
-                node = Box::new(Expr::Div(node, rhs));
-            }
-            Token::Mod => {
-                iter.next();
-                let rhs = parse_primary(iter);
-                node = Box::new(Expr::Mod(node, rhs));
-            }
-            _ => break,
-        }
-    }
-    node
-}
-
-fn parse_primary(iter: &mut Peekable<Iter<Token>>) -> Box<Expr> {
-    match iter.next() {
-        Some(Token::Number(n)) => Box::new(Expr::Number(*n)),
-
-        Some(Token::Identifier(name)) => {
-            let nm = name.clone();
-            if let Some(Token::LParen) = iter.peek() {
-                iter.next();
-                let mut args = Vec::new();
-                while let Some(tok2) = iter.peek() {
-                    if **tok2 == Token::RParen {
-                        break;
-                    }
-                    let arg = parse_expr(iter);
-                    args.push(*arg);
-                    if let Some(Token::Comma) = iter.peek() {
-                        iter.next();
-                    }
+    fn parse_statement(&mut self) -> ParseResult<ASTNode> {
+        match self.peek() {
+            Token::Keyword(ref k) if k == "return" => {
+                self.next_token();  // Consume "return"
+                let expr = self.parse_expr()?;
+                
+                // Check for semicolon after return statement
+                match self.peek() {
+                    Token::Operator(ref op) if op == ";" => {
+                        self.next_token();
+                        Ok(ASTNode::Return(Box::new(expr)))
+                    },
+                    _ => Err(ParseError::MissingSemicolon),
                 }
-                expect_token(iter, Token::RParen);
-                Box::new(Expr::Call(nm, args))
+            }
+            Token::Keyword(ref k) if k == "if" => {
+                self.parse_if_statement()
+            },
+            Token::Keyword(ref k) if k == "while" => {
+                self.parse_while_statement()
+            },
+            Token::Keyword(ref k) if k == "for" => {
+                self.parse_for_statement()
+            },
+            Token::Operator(ref o) if o == "{" => self.parse_block(),
+            _ => {
+                let expr = self.parse_expr()?;
+                
+                // Check for semicolon after expression
+                if self.peek() == Token::Operator(";".into()) {
+                    self.next_token();
+                }
+                
+                Ok(expr)
+            }
+        }
+    }
+
+    // New dedicated method for parsing if statements
+    fn parse_if_statement(&mut self) -> ParseResult<ASTNode> {
+        self.next_token();  // Consume "if"
+        
+        // Check for opening parenthesis
+        if self.next_token() != Token::Operator("(".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        let condition = self.parse_expr()?;
+        
+        // Check for closing parenthesis
+        if self.next_token() != Token::Operator(")".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        let then_branch = self.parse_statement()?;
+        
+        let else_branch = if self.peek() == Token::Keyword("else".into()) {
+            self.next_token();  // Consume "else"
+            
+            // Handle else if
+            if self.peek() == Token::Keyword("if".into()) {
+                Some(Box::new(self.parse_if_statement()?))
             } else {
-                Box::new(Expr::Var(nm))
+                Some(Box::new(self.parse_statement()?))
+            }
+        } else {
+            None
+        };
+        
+        Ok(ASTNode::If {
+            condition: Box::new(condition),
+            then_branch: Box::new(then_branch),
+            else_branch,
+        })
+    }
+
+    // New dedicated method for parsing while statements
+    fn parse_while_statement(&mut self) -> ParseResult<ASTNode> {
+        self.next_token();  // Consume "while"
+        
+        // Check for opening parenthesis
+        if self.next_token() != Token::Operator("(".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        let condition = self.parse_expr()?;
+        
+        // Check for closing parenthesis
+        if self.next_token() != Token::Operator(")".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        let body = self.parse_statement()?;
+        
+        Ok(ASTNode::While {
+            condition: Box::new(condition),
+            body: Box::new(body),
+        })
+    }
+
+    // New dedicated method for parsing for statements
+    fn parse_for_statement(&mut self) -> ParseResult<ASTNode> {
+        self.next_token();  // Consume "for"
+        
+        // Check for opening parenthesis
+        if self.next_token() != Token::Operator("(".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        // Parse initialization expression
+        let init = if self.peek() != Token::Operator(";".into()) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        
+        // Check for first semicolon
+        if self.next_token() != Token::Operator(";".into()) {
+            return Err(ParseError::MissingSemicolon);
+        }
+        
+        // Parse condition expression
+        let condition = if self.peek() != Token::Operator(";".into()) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        
+        // Check for second semicolon
+        if self.next_token() != Token::Operator(";".into()) {
+            return Err(ParseError::MissingSemicolon);
+        }
+        
+        // Parse update expression
+        let update = if self.peek() != Token::Operator(")".into()) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        
+        // Check for closing parenthesis
+        if self.next_token() != Token::Operator(")".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        let body = self.parse_statement()?;
+        
+        Ok(ASTNode::For {
+            init,
+            condition,
+            update,
+            body: Box::new(body),
+        })
+    }
+
+    fn parse_block(&mut self) -> ParseResult<ASTNode> {
+        // Check for opening brace
+        match self.next_token() {
+            Token::Operator(op) if op == "{" => (),
+            other => return Err(ParseError::UnexpectedToken(other, "{".to_string())),
+        }
+        
+        let mut stmts = Vec::new();
+        
+        while self.peek() != Token::Operator("}".into()) && self.peek() != Token::EOF {
+            stmts.push(self.parse_statement()?);
+        }
+        
+        // Check for closing brace
+        match self.next_token() {
+            Token::Operator(op) if op == "}" => (),
+            Token::EOF => return Err(ParseError::UnexpectedEOF("}".to_string())),
+            other => return Err(ParseError::UnexpectedToken(other, "}".to_string())),
+        }
+        
+        Ok(ASTNode::Block(stmts))
+    }
+
+    fn parse_expr(&mut self) -> ParseResult<ASTNode> {
+        self.parse_assignment()
+    }
+
+    fn parse_assignment(&mut self) -> ParseResult<ASTNode> {
+        if let Token::Id(name) = self.peek() {
+            let name_clone = name.clone();
+            self.next_token();
+            
+            if self.peek() == Token::Operator("=".into()) {
+                self.next_token();
+                let value = self.parse_ternary()?;
+                return Ok(ASTNode::Assignment {
+                    name: name_clone,
+                    value: Box::new(value),
+                });
+            } else {
+                self.pos -= 1;
+            }
+        } else if self.peek() == Token::Operator("=".into()) {
+            return Err(ParseError::InvalidAssignmentTarget);
+        }
+        
+        self.parse_ternary()
+    }
+
+    fn parse_ternary(&mut self) -> ParseResult<ASTNode> {
+        let cond = self.parse_logical_or()?;
+        
+        if self.peek() == Token::Operator("?".into()) {
+            self.next_token();
+            let then_expr = self.parse_expr()?;
+            
+            match self.next_token() {
+                Token::Operator(op) if op == ":" => (),
+                Token::EOF => return Err(ParseError::UnexpectedEOF(":".to_string())),
+                other => return Err(ParseError::UnexpectedToken(other, ":".to_string())),
+            }
+            
+            let else_expr = self.parse_expr()?;
+            
+            return Ok(ASTNode::Ternary {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            });
+        }
+        
+        Ok(cond)
+    }
+
+    fn parse_logical_or(&mut self) -> ParseResult<ASTNode> {
+        let mut left = self.parse_logical_and()?;
+        
+        while self.peek() == Token::Operator("||".into()) {
+            let op = match self.next_token() {
+                Token::Operator(op_str) => op_str,
+                _ => unreachable!(),
+            };
+            let right = self.parse_logical_and()?;
+            left = ASTNode::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+
+    fn parse_logical_and(&mut self) -> ParseResult<ASTNode> {
+        let mut left = self.parse_equality()?;
+        
+        while self.peek() == Token::Operator("&&".into()) {
+            let op = match self.next_token() {
+                Token::Operator(op_str) => op_str,
+                _ => unreachable!(),
+            };
+            let right = self.parse_equality()?;
+            left = ASTNode::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+
+    fn parse_equality(&mut self) -> ParseResult<ASTNode> {
+        let mut left = self.parse_comparison()?;
+        
+        while matches!(self.peek(), Token::Operator(ref op) if op == "==" || op == "!=") {
+            let op = match self.next_token() {
+                Token::Operator(op_str) => op_str,
+                _ => unreachable!(),
+            };
+            let right = self.parse_comparison()?;
+            left = ASTNode::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+
+    fn parse_comparison(&mut self) -> ParseResult<ASTNode> {
+        let mut left = self.parse_term()?;
+        
+        while matches!(self.peek(), Token::Operator(ref op) if op == "<" || op == "<=" || op == ">" || op == ">=") {
+            let op = match self.next_token() {
+                Token::Operator(op_str) => op_str,
+                _ => unreachable!(),
+            };
+            let right = self.parse_term()?;
+            left = ASTNode::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+
+    fn parse_term(&mut self) -> ParseResult<ASTNode> {
+        let mut left = self.parse_factor()?;
+        
+        while matches!(self.peek(), Token::Operator(ref op) if op == "+" || op == "-") {
+            let op = match self.next_token() {
+                Token::Operator(op_str) => op_str,
+                _ => unreachable!(),
+            };
+            let right = self.parse_factor()?;
+            left = ASTNode::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+
+    fn parse_factor(&mut self) -> ParseResult<ASTNode> {
+        let mut left = self.parse_unary()?;
+        
+        while matches!(self.peek(), Token::Operator(ref op) if op == "*" || op == "/" || op == "%") {
+            let op = match self.next_token() {
+                Token::Operator(op_str) => op_str,
+                _ => unreachable!(),
+            };
+            let right = self.parse_unary()?;
+            left = ASTNode::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> ParseResult<ASTNode> {
+        match self.peek() {
+            Token::Operator(ref op) if op == "-" || op == "!" || op == "~" => {
+                let op = match self.next_token() {
+                    Token::Operator(op_str) => op_str,
+                    _ => unreachable!(),
+                };
+                let expr = self.parse_unary()?;
+                Ok(ASTNode::UnaryOp {
+                    op,
+                    expr: Box::new(expr),
+                })
+            },
+            _ => self.parse_call_or_primary(),
+        }
+    }
+
+    fn parse_call_or_primary(&mut self) -> ParseResult<ASTNode> {
+        if let Token::Id(name) = self.peek() {
+            let name_clone = name.clone();
+            self.next_token();
+            
+            if self.peek() == Token::Operator("(".into()) {
+                self.next_token();
+                let args = self.parse_args()?;
+                return Ok(ASTNode::Call { name: name_clone, args });
+            } else {
+                self.pos -= 1;
             }
         }
+        
+        self.parse_primary()
+    }
 
-        Some(Token::LParen) => {
-            let e = parse_expr(iter);
-            expect_token(iter, Token::RParen);
-            e
+    fn parse_args(&mut self) -> ParseResult<Vec<ASTNode>> {
+        let mut args = Vec::new();
+        
+        if self.peek() != Token::Operator(")".into()) {
+            args.push(self.parse_expr()?);
+            
+            while self.peek() == Token::Operator(",".into()) {
+                self.next_token();
+                args.push(self.parse_expr()?);
+            }
         }
+        
+        // Check for closing parenthesis
+        if self.next_token() != Token::Operator(")".into()) {
+            return Err(ParseError::MissingParenthesis);
+        }
+        
+        Ok(args)
+    }
 
-        other => panic!("Expected primary, got {:?}", other),
+    fn parse_primary(&mut self) -> ParseResult<ASTNode> {
+        match self.next_token() {
+            Token::Num(n) => Ok(ASTNode::Number(n)),
+            Token::Id(name) => Ok(ASTNode::Identifier(name)),
+            Token::CharLiteral(c) => Ok(ASTNode::CharLiteral(c)),
+            Token::StringLiteral(s) => Ok(ASTNode::StringLiteral(s)),
+            Token::Operator(op) if op == "(" => {
+                let expr = self.parse_expr()?;
+                
+                // Check for closing parenthesis
+                if self.next_token() != Token::Operator(")".into()) {
+                    return Err(ParseError::MissingParenthesis);
+                }
+                
+                Ok(expr)
+            },
+            Token::EOF => Err(ParseError::UnexpectedEOF("expression".to_string())),
+            Token::Unknown(c) => Err(ParseError::UnexpectedToken(
+                Token::Unknown(c),
+                "valid expression".to_string()
+            )),
+            token => Err(ParseError::UnexpectedToken(token, "expression".to_string())),
+        }
+    }
+
+    fn expect_keyword(&mut self, kw: &str) -> ParseResult<()> {
+        match self.next_token() {
+            Token::Keyword(s) if s == kw => Ok(()),
+            Token::EOF => Err(ParseError::UnexpectedEOF(kw.to_string())),
+            other => Err(ParseError::UnexpectedToken(other, kw.to_string())),
+        }
+    }
+
+    fn peek(&self) -> Token {
+        self.tokens.get(self.pos).cloned().unwrap_or(Token::EOF)
+    }
+
+    fn next_token(&mut self) -> Token {
+        let t = self.peek();
+        self.pos += 1;
+        t
     }
 }
 
-fn expect_token(iter: &mut Peekable<Iter<Token>>, expected: Token) {
-    match iter.next() {
-        Some(t) if *t == expected => {}
-        other => panic!("Expected {:?}, got {:?}", expected, other),
-    }
+// Modified parse_control_flow function
+pub fn parse_control_flow(tokens: Vec<Token>) -> Result<ASTNode, ParseError> {
+    let mut parser = Parser::new(tokens);
+    parser.parse_program()
 }
