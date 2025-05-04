@@ -1,609 +1,511 @@
-// Modified parser.rs with fixes for control flow parsing
-use crate::lexer::Token;
-use std::fmt;
+// src/parser.rs
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum ASTNode {
-    Program(Vec<ASTNode>),
+use crate::lexer::Token;
+use crate::error::{Error, Result};
+use std::collections::VecDeque;
+
+/// C4 types: char, int, void, and pointers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+    Char,
+    Int,
+    Void,
+    Ptr(Box<Type>),
+}
+
+/// One variant in an enum declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: i64,
+}
+
+/// Top‐level declarations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decl {
+    Enum {
+        name: Option<String>,
+        variants: Vec<EnumVariant>,
+    },
+    Global {
+        name: String,
+        ty: Type,
+        init: Option<Expr>,
+    },
     Function {
         name: String,
-        params: Vec<(String, String)>, // Changed to (type, name)
-        body: Vec<ASTNode>,
+        ret_ty: Type,
+        params: Vec<(String, Type)>,
+        body: Vec<Stmt>,
     },
-    Return(Box<ASTNode>),
-    Number(i64),
-    Identifier(String),
-    Assignment {
-        name: String,
-        value: Box<ASTNode>,
-    },
-    UnaryOp {
-        op: String,
-        expr: Box<ASTNode>,
-    },
-    BinaryOp {
-        op: String,
-        left: Box<ASTNode>,
-        right: Box<ASTNode>,
-    },
+}
+
+/// Statements, including local declarations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Decl(Decl),
+    Expr(Expr),
+    Return(Option<Expr>),
     If {
-        condition: Box<ASTNode>,
-        then_branch: Box<ASTNode>,
-        else_branch: Option<Box<ASTNode>>,
-    },
-    Block(Vec<ASTNode>),
-    Ternary {
-        cond: Box<ASTNode>,
-        then_expr: Box<ASTNode>,
-        else_expr: Box<ASTNode>,
+        cond: Expr,
+        then_br: Box<Stmt>,
+        else_br: Option<Box<Stmt>>,
     },
     While {
-        condition: Box<ASTNode>,
-        body: Box<ASTNode>,
+        cond: Expr,
+        body: Box<Stmt>,
     },
     For {
-        init: Option<Box<ASTNode>>,
-        condition: Option<Box<ASTNode>>,
-        update: Option<Box<ASTNode>>,
-        body: Box<ASTNode>,
+        init: Option<Expr>,
+        cond: Option<Expr>,
+        update: Option<Expr>,
+        body: Box<Stmt>,
     },
-    Call {
-        name: String,
-        args: Vec<ASTNode>,
-    },
-    CharLiteral(char),
-    StringLiteral(String),
+    Block(Vec<Stmt>),
 }
 
-#[derive(Debug)]
-pub enum ParseError {
-    UnexpectedToken(Token, String),
-    UnexpectedEOF(String),
-    InvalidAssignmentTarget,
-    InvalidParameter,
-    InvalidExpression,
-    MissingSemicolon,
-    MissingBrace,
-    MissingParenthesis,
+/// Expressions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Num(i64),
+    Char(i64),
+    Str(String),
+    Ident(String),
+    SizeOf(Type),
+    Cast { to: Type, expr: Box<Expr> },
+    Unary { op: UnaryOp, expr: Box<Expr> },
+    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
+    Conditional { cond: Box<Expr>, then_: Box<Expr>, else_: Box<Expr> },
+    Call { func: Box<Expr>, args: Vec<Expr> },
+    Index { base: Box<Expr>, idx: Box<Expr> },
 }
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::UnexpectedToken(t, expected) => 
-                write!(f, "ParseError: Unexpected token {:?}, expected {}", t, expected),
-            ParseError::UnexpectedEOF(expected) =>
-                write!(f, "ParseError: Unexpected EOF, expected {}", expected),
-            ParseError::InvalidAssignmentTarget =>
-                write!(f, "ParseError: Invalid assignment target"),
-            ParseError::InvalidParameter =>
-                write!(f, "ParseError: Invalid parameter"),
-            ParseError::InvalidExpression =>
-                write!(f, "ParseError: Invalid expression"),
-            ParseError::MissingSemicolon =>
-                write!(f, "ParseError: Missing semicolon"),
-            ParseError::MissingBrace =>
-                write!(f, "ParseError: Missing brace"),
-            ParseError::MissingParenthesis =>
-                write!(f, "ParseError: Missing parenthesis"),
-        }
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryOp {
+    Plus, Minus, Not, BitNot, Deref, Addr,
+    PreInc, PreDec, PostInc, PostDec,
 }
 
-impl std::error::Error for ParseError {}
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOp {
+    Assign, Lor, Lan, Or, Xor, And,
+    Eq, Ne, Lt, Gt, Le, Ge,
+    Shl, Shr, Add, Sub, Mul, Div, Mod,
+}
 
-type ParseResult<T> = std::result::Result<T, ParseError>;
-
+/// Parser with a small queue for comma‐separated globals.
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    pending_globals: VecDeque<Decl>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Parser { tokens, pos: 0, pending_globals: VecDeque::new() }
     }
 
-    pub fn parse_program(&mut self) -> ParseResult<ASTNode> {
-        let mut nodes = Vec::new();
+    /// Parse all top‐level declarations until EOF.
+    pub fn parse(&mut self) -> Result<Vec<Decl>> {
+        let mut decls = Vec::new();
         while self.peek() != Token::EOF {
-            nodes.push(self.parse_function()?);
+            if let Some(g) = self.pending_globals.pop_front() {
+                decls.push(g);
+            } else {
+                decls.push(self.parse_decl()?);
+            }
         }
-        Ok(ASTNode::Program(nodes))
+        Ok(decls)
     }
 
-    fn parse_function(&mut self) -> ParseResult<ASTNode> {
-        // Parse return type
-        self.expect_keyword("int")?;
-        // Parse function name
-        let name = match self.next_token() {
-            Token::Id(s) => s,
-            t => return Err(ParseError::UnexpectedToken(t, "function name".to_string())),
-        };
-        // Check for opening parenthesis
-        if self.next_token() != Token::Operator("(".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        // *New Check*: Detect missing closing ')' if next token is '{'
-        if self.peek() == Token::Operator("{".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        // Proceed with parsing parameters...
-        let mut params = Vec::new();
-        if self.peek() != Token::Operator(")".into()) {
-            loop {
-                let param_type = match self.next_token() {
-                    Token::Keyword(s) => s,
-                    t => return Err(ParseError::UnexpectedToken(t, "parameter type".to_string())),
-                };
-                let param_name = match self.next_token() {
-                    Token::Id(s) => s,
-                    t => return Err(ParseError::UnexpectedToken(t, "parameter name".to_string())),
-                };
-                params.push((param_type, param_name));
-                if self.peek() != Token::Operator(",".into()) {
-                    break;
+    /// Parse one top‐level decl: enum, globals (comma‐list), or function.
+    fn parse_decl(&mut self) -> Result<Decl> {
+        if let Token::Keyword(ref k) = self.peek() {
+            // enum
+            if k == "enum" {
+                return self.parse_enum_decl();
+            }
+            // int/char/void globals or functions
+            if k == "int" || k == "char" || k == "void" {
+                let base_ty = self.parse_type()?;
+                // pointer stars before name
+                let mut ty0 = base_ty.clone();
+                while self.peek() == Token::Operator("*".into()) {
+                    self.advance();
+                    ty0 = Type::Ptr(Box::new(ty0));
                 }
-                self.next_token();
+                let name = self.consume_ident()?;
+
+                // function?
+                if self.peek() == Token::Operator("(".into()) {
+                    return self.parse_function_decl(name, ty0);
+                }
+
+                // otherwise globals comma‐list
+                let mut globals = Vec::new();
+                globals.push(Decl::Global { name: name.clone(), ty: ty0.clone(), init: None });
+
+                // optional init for first
+                if self.peek() == Token::Operator("=".into()) {
+                    self.advance();
+                    let e = self.parse_expr()?;
+                    if let Decl::Global { ref mut init, .. } = globals[0] { *init = Some(e); }
+                }
+
+                // further comma-separated
+                while self.peek() == Token::Operator(",".into()) {
+                    self.advance();
+                    let mut ty = base_ty.clone();
+                    while self.peek() == Token::Operator("*".into()) {
+                        self.advance();
+                        ty = Type::Ptr(Box::new(ty));
+                    }
+                    let nm = self.consume_ident()?;
+                    let mut init = None;
+                    if self.peek() == Token::Operator("=".into()) {
+                        self.advance();
+                        init = Some(self.parse_expr()?);
+                    }
+                    globals.push(Decl::Global { name: nm, ty, init });
+                }
+
+                self.expect_op(";")?;
+                let first = globals.remove(0);
+                for g in globals.into_iter().rev() {
+                    self.pending_globals.push_front(g);
+                }
+                return Ok(first);
             }
         }
-        // Check for closing parenthesis
-        if self.next_token() != Token::Operator(")".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        let body = self.parse_block()?;
-        Ok(ASTNode::Function { 
-            name, 
-            params, 
-            body: match body {
-                ASTNode::Block(stmts) => stmts,
-                _ => vec![body],
-            }
-        })
+        Err(Error::Syntax(format!("Unexpected token {:?}", self.peek())))
     }
-    fn parse_statement(&mut self) -> ParseResult<ASTNode> {
+
+    fn parse_enum_decl(&mut self) -> Result<Decl> {
+        self.consume_keyword("enum")?;
+        let name = if let Token::Id(_) = self.peek() {
+            Some(self.consume_ident()?)
+        } else {
+            None
+        };
+        self.expect_op("{")?;
+        let mut variants = Vec::new();
+        let mut val = 0;
+        loop {
+            let vname = self.consume_ident()?;
+            if self.peek() == Token::Operator("=".into()) {
+                self.advance();
+                if let Expr::Num(n) = self.parse_expr()? { val = n; }
+            }
+            variants.push(EnumVariant { name: vname, value: val });
+            val += 1;
+            if self.peek() == Token::Operator(",".into()) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect_op("}")?;
+        self.expect_op(";")?;
+        Ok(Decl::Enum { name, variants })
+    }
+
+    fn parse_function_decl(&mut self, name: String, ret_ty: Type) -> Result<Decl> {
+        self.expect_op("(")?;
+        let mut params = Vec::new();
+        while self.peek() != Token::Operator(")".into()) {
+            // parse parameter type
+            let base = self.parse_type()?;
+            let mut pty = base.clone();
+            while self.peek() == Token::Operator("*".into()) {
+                self.advance();
+                pty = Type::Ptr(Box::new(pty));
+            }
+            // then the identifier
+            let pid = self.consume_ident()?;
+            params.push((pid, pty));
+            if self.peek() == Token::Operator(",".into()) {
+                self.advance();
+            }
+        }
+        self.expect_op(")")?;
+        let body = self.parse_block_stmt()?;
+        if let Stmt::Block(stmts) = body {
+            Ok(Decl::Function { name, ret_ty, params, body: stmts })
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn parse_block_stmt(&mut self) -> Result<Stmt> {
+        self.expect_op("{")?;
+        let mut stmts = Vec::new();
+        while self.peek() != Token::Operator("}".into()) {
+            stmts.push(self.parse_stmt()?);
+        }
+        self.expect_op("}")?;
+        Ok(Stmt::Block(stmts))
+    }
+
+    fn parse_stmt(&mut self) -> Result<Stmt> {
+        // local declarations
+        if let Token::Keyword(ref k) = self.peek() {
+            if k == "int" || k == "char" || k == "void" {
+                let base = self.parse_type()?;
+                let mut locals = Vec::new();
+                loop {
+                    let mut ty = base.clone();
+                    while self.peek() == Token::Operator("*".into()) {
+                        self.advance();
+                        ty = Type::Ptr(Box::new(ty));
+                    }
+                    let nm = self.consume_ident()?;
+                    locals.push(Decl::Global { name: nm, ty, init: None });
+                    if self.peek() == Token::Operator(",".into()) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect_op(";")?;
+                return Ok(Stmt::Decl(locals.remove(0)));
+            }
+        }
+
         match self.peek() {
             Token::Keyword(ref k) if k == "return" => {
-                self.next_token();  // Consume "return"
-                let expr = self.parse_expr()?;
-                
-                // Check for semicolon after return statement
-                match self.peek() {
-                    Token::Operator(ref op) if op == ";" => {
-                        self.next_token();
-                        Ok(ASTNode::Return(Box::new(expr)))
-                    },
-                    _ => Err(ParseError::MissingSemicolon),
-                }
+                self.advance();
+                let e = if self.peek() != Token::Operator(";".into()) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                self.expect_op(";")?;
+                Ok(Stmt::Return(e))
             }
             Token::Keyword(ref k) if k == "if" => {
-                self.parse_if_statement()
-            },
-            Token::Keyword(ref k) if k == "while" => {
-                self.parse_while_statement()
-            },
-            Token::Keyword(ref k) if k == "for" => {
-                self.parse_for_statement()
-            },
-            Token::Operator(ref o) if o == "{" => self.parse_block(),
-            _ => {
-                let expr = self.parse_expr()?;
-                
-                // Check for semicolon after expression
-                if self.peek() == Token::Operator(";".into()) {
-                    self.next_token();
-                }
-                
-                Ok(expr)
-            }
-        }
-    }
-
-    // New dedicated method for parsing if statements
-    fn parse_if_statement(&mut self) -> ParseResult<ASTNode> {
-        self.next_token();  // Consume "if"
-        
-        // Check for opening parenthesis
-        if self.next_token() != Token::Operator("(".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        let condition = self.parse_expr()?;
-        
-        // Check for closing parenthesis
-        if self.next_token() != Token::Operator(")".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        let then_branch = self.parse_statement()?;
-        
-        let else_branch = if self.peek() == Token::Keyword("else".into()) {
-            self.next_token();  // Consume "else"
-            
-            // Handle else if
-            if self.peek() == Token::Keyword("if".into()) {
-                Some(Box::new(self.parse_if_statement()?))
-            } else {
-                Some(Box::new(self.parse_statement()?))
-            }
-        } else {
-            None
-        };
-        
-        Ok(ASTNode::If {
-            condition: Box::new(condition),
-            then_branch: Box::new(then_branch),
-            else_branch,
-        })
-    }
-
-    // New dedicated method for parsing while statements
-    fn parse_while_statement(&mut self) -> ParseResult<ASTNode> {
-        self.next_token();  // Consume "while"
-        
-        // Check for opening parenthesis
-        if self.next_token() != Token::Operator("(".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        let condition = self.parse_expr()?;
-        
-        // Check for closing parenthesis
-        if self.next_token() != Token::Operator(")".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        let body = self.parse_statement()?;
-        
-        Ok(ASTNode::While {
-            condition: Box::new(condition),
-            body: Box::new(body),
-        })
-    }
-
-    // New dedicated method for parsing for statements
-    fn parse_for_statement(&mut self) -> ParseResult<ASTNode> {
-        self.next_token();  // Consume "for"
-        
-        // Check for opening parenthesis
-        if self.next_token() != Token::Operator("(".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        // Parse initialization expression
-        let init = if self.peek() != Token::Operator(";".into()) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
-        
-        // Check for first semicolon
-        if self.next_token() != Token::Operator(";".into()) {
-            return Err(ParseError::MissingSemicolon);
-        }
-        
-        // Parse condition expression
-        let condition = if self.peek() != Token::Operator(";".into()) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
-        
-        // Check for second semicolon
-        if self.next_token() != Token::Operator(";".into()) {
-            return Err(ParseError::MissingSemicolon);
-        }
-        
-        // Parse update expression
-        let update = if self.peek() != Token::Operator(")".into()) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
-        
-        // Check for closing parenthesis
-        if self.next_token() != Token::Operator(")".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        let body = self.parse_statement()?;
-        
-        Ok(ASTNode::For {
-            init,
-            condition,
-            update,
-            body: Box::new(body),
-        })
-    }
-
-    fn parse_block(&mut self) -> ParseResult<ASTNode> {
-        // Check for opening brace
-        match self.next_token() {
-            Token::Operator(op) if op == "{" => (),
-            other => return Err(ParseError::UnexpectedToken(other, "{".to_string())),
-        }
-        
-        let mut stmts = Vec::new();
-        
-        while self.peek() != Token::Operator("}".into()) && self.peek() != Token::EOF {
-            stmts.push(self.parse_statement()?);
-        }
-        
-        // Check for closing brace
-        match self.next_token() {
-            Token::Operator(op) if op == "}" => (),
-            Token::EOF => return Err(ParseError::UnexpectedEOF("}".to_string())),
-            other => return Err(ParseError::UnexpectedToken(other, "}".to_string())),
-        }
-        
-        Ok(ASTNode::Block(stmts))
-    }
-
-    fn parse_expr(&mut self) -> ParseResult<ASTNode> {
-        self.parse_assignment()
-    }
-
-    fn parse_assignment(&mut self) -> ParseResult<ASTNode> {
-        if let Token::Id(name) = self.peek() {
-            let name_clone = name.clone();
-            self.next_token();
-            
-            if self.peek() == Token::Operator("=".into()) {
-                self.next_token();
-                let value = self.parse_ternary()?;
-                return Ok(ASTNode::Assignment {
-                    name: name_clone,
-                    value: Box::new(value),
-                });
-            } else {
-                self.pos -= 1;
-            }
-        } else if self.peek() == Token::Operator("=".into()) {
-            return Err(ParseError::InvalidAssignmentTarget);
-        }
-        
-        self.parse_ternary()
-    }
-
-    fn parse_ternary(&mut self) -> ParseResult<ASTNode> {
-        let cond = self.parse_logical_or()?;
-        
-        if self.peek() == Token::Operator("?".into()) {
-            self.next_token();
-            let then_expr = self.parse_expr()?;
-            
-            match self.next_token() {
-                Token::Operator(op) if op == ":" => (),
-                Token::EOF => return Err(ParseError::UnexpectedEOF(":".to_string())),
-                other => return Err(ParseError::UnexpectedToken(other, ":".to_string())),
-            }
-            
-            let else_expr = self.parse_expr()?;
-            
-            return Ok(ASTNode::Ternary {
-                cond: Box::new(cond),
-                then_expr: Box::new(then_expr),
-                else_expr: Box::new(else_expr),
-            });
-        }
-        
-        Ok(cond)
-    }
-
-    fn parse_logical_or(&mut self) -> ParseResult<ASTNode> {
-        let mut left = self.parse_logical_and()?;
-        
-        while self.peek() == Token::Operator("||".into()) {
-            let op = match self.next_token() {
-                Token::Operator(op_str) => op_str,
-                _ => unreachable!(),
-            };
-            let right = self.parse_logical_and()?;
-            left = ASTNode::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-
-    fn parse_logical_and(&mut self) -> ParseResult<ASTNode> {
-        let mut left = self.parse_equality()?;
-        
-        while self.peek() == Token::Operator("&&".into()) {
-            let op = match self.next_token() {
-                Token::Operator(op_str) => op_str,
-                _ => unreachable!(),
-            };
-            let right = self.parse_equality()?;
-            left = ASTNode::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-
-    fn parse_equality(&mut self) -> ParseResult<ASTNode> {
-        let mut left = self.parse_comparison()?;
-        
-        while matches!(self.peek(), Token::Operator(ref op) if op == "==" || op == "!=") {
-            let op = match self.next_token() {
-                Token::Operator(op_str) => op_str,
-                _ => unreachable!(),
-            };
-            let right = self.parse_comparison()?;
-            left = ASTNode::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-
-    fn parse_comparison(&mut self) -> ParseResult<ASTNode> {
-        let mut left = self.parse_term()?;
-        
-        while matches!(self.peek(), Token::Operator(ref op) if op == "<" || op == "<=" || op == ">" || op == ">=") {
-            let op = match self.next_token() {
-                Token::Operator(op_str) => op_str,
-                _ => unreachable!(),
-            };
-            let right = self.parse_term()?;
-            left = ASTNode::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-
-    fn parse_term(&mut self) -> ParseResult<ASTNode> {
-        let mut left = self.parse_factor()?;
-        
-        while matches!(self.peek(), Token::Operator(ref op) if op == "+" || op == "-") {
-            let op = match self.next_token() {
-                Token::Operator(op_str) => op_str,
-                _ => unreachable!(),
-            };
-            let right = self.parse_factor()?;
-            left = ASTNode::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-
-    fn parse_factor(&mut self) -> ParseResult<ASTNode> {
-        let mut left = self.parse_unary()?;
-        
-        while matches!(self.peek(), Token::Operator(ref op) if op == "*" || op == "/" || op == "%") {
-            let op = match self.next_token() {
-                Token::Operator(op_str) => op_str,
-                _ => unreachable!(),
-            };
-            let right = self.parse_unary()?;
-            left = ASTNode::BinaryOp {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-
-    fn parse_unary(&mut self) -> ParseResult<ASTNode> {
-        match self.peek() {
-            Token::Operator(ref op) if op == "-" || op == "!" || op == "~" => {
-                let op = match self.next_token() {
-                    Token::Operator(op_str) => op_str,
-                    _ => unreachable!(),
+                self.advance(); self.expect_op("(")?;
+                let cond = self.parse_expr()?; self.expect_op(")")?;
+                let then_br = Box::new(self.parse_stmt()?);
+                let else_br = if self.peek() == Token::Keyword("else".into()) {
+                    self.advance();
+                    Some(Box::new(self.parse_stmt()?))
+                } else {
+                    None
                 };
-                let expr = self.parse_unary()?;
-                Ok(ASTNode::UnaryOp {
-                    op,
-                    expr: Box::new(expr),
+                Ok(Stmt::If { cond, then_br, else_br })
+            }
+            Token::Keyword(ref k) if k == "while" => {
+                self.advance(); self.expect_op("(")?;
+                let cond = self.parse_expr()?; self.expect_op(")")?;
+                Ok(Stmt::While { cond, body: Box::new(self.parse_stmt()?) })
+            }
+            Token::Keyword(ref k) if k == "for" => {
+                self.advance(); self.expect_op("(")?;
+                let init = if self.peek() != Token::Operator(";".into()) {
+                    Some(self.parse_expr()?)
+                } else { None };
+                self.expect_op(";")?;
+                let cond = if self.peek() != Token::Operator(";".into()) {
+                    Some(self.parse_expr()?)
+                } else { None };
+                self.expect_op(";")?;
+                let update = if self.peek() != Token::Operator(")".into()) {
+                    Some(self.parse_expr()?)
+                } else { None };
+                self.expect_op(")")?;
+                Ok(Stmt::For {
+                    init, cond, update,
+                    body: Box::new(self.parse_stmt()?),
                 })
-            },
-            _ => self.parse_call_or_primary(),
-        }
-    }
-
-    fn parse_call_or_primary(&mut self) -> ParseResult<ASTNode> {
-        if let Token::Id(name) = self.peek() {
-            let name_clone = name.clone();
-            self.next_token();
-            
-            if self.peek() == Token::Operator("(".into()) {
-                self.next_token();
-                let args = self.parse_args()?;
-                return Ok(ASTNode::Call { name: name_clone, args });
-            } else {
-                self.pos -= 1;
+            }
+            Token::Operator(ref s) if s == "{" => self.parse_block_stmt(),
+            _ => {
+                let e = self.parse_expr()?;
+                self.expect_op(";")?;
+                Ok(Stmt::Expr(e))
             }
         }
-        
-        self.parse_primary()
     }
 
-    fn parse_args(&mut self) -> ParseResult<Vec<ASTNode>> {
-        let mut args = Vec::new();
-        
-        if self.peek() != Token::Operator(")".into()) {
-            args.push(self.parse_expr()?);
-            
-            while self.peek() == Token::Operator(",".into()) {
-                self.next_token();
-                args.push(self.parse_expr()?);
-            }
+    fn parse_expr(&mut self) -> Result<Expr> { self.parse_conditional() }
+
+    fn parse_conditional(&mut self) -> Result<Expr> {
+        let mut e = self.parse_binary(0)?;
+        if self.peek() == Token::Operator("?".into()) {
+            self.advance();
+            let t = Box::new(self.parse_expr()?);
+            self.expect_op(":")?;
+            let f = Box::new(self.parse_expr()?);
+            e = Expr::Conditional { cond: Box::new(e), then_: t, else_: f };
         }
-        
-        // Check for closing parenthesis
-        if self.next_token() != Token::Operator(")".into()) {
-            return Err(ParseError::MissingParenthesis);
-        }
-        
-        Ok(args)
+        Ok(e)
     }
 
-    fn parse_primary(&mut self) -> ParseResult<ASTNode> {
-        match self.next_token() {
-            Token::Num(n) => Ok(ASTNode::Number(n)),
-            Token::Id(name) => Ok(ASTNode::Identifier(name)),
-            Token::CharLiteral(c) => Ok(ASTNode::CharLiteral(c)),
-            Token::StringLiteral(s) => Ok(ASTNode::StringLiteral(s)),
-            Token::Operator(op) if op == "(" => {
-                let expr = self.parse_expr()?;
-                
-                // Check for closing parenthesis
-                if self.next_token() != Token::Operator(")".into()) {
-                    return Err(ParseError::MissingParenthesis);
+    fn parse_binary(&mut self, prec: usize) -> Result<Expr> {
+        const OPS: &[(&[&str], fn() -> BinaryOp)] = &[
+            (&["="],   || BinaryOp::Assign),
+            (&["||"],  || BinaryOp::Lor),
+            (&["&&"],  || BinaryOp::Lan),
+            (&["|"],   || BinaryOp::Or),
+            (&["^"],   || BinaryOp::Xor),
+            (&["&"],   || BinaryOp::And),
+            (&["==","!="], || BinaryOp::Eq),
+            (&["<",">","<=",">="], || BinaryOp::Lt),
+            (&["<<",">>"], || BinaryOp::Shl),
+            (&["+","-"], || BinaryOp::Add),
+            (&["*","/","%"], || BinaryOp::Mul),
+        ];
+        if prec == OPS.len() {
+            return self.parse_unary();
+        }
+        let mut lhs = self.parse_binary(prec+1)?;
+        loop {
+            let mut found = None;
+            if let Token::Operator(ref s) = self.peek() {
+                for &(syms, ctor) in &OPS[prec..=prec] {
+                    if syms.contains(&s.as_str()) {
+                        found = Some(ctor());
+                        break;
+                    }
                 }
-                
-                Ok(expr)
-            },
-            Token::EOF => Err(ParseError::UnexpectedEOF("expression".to_string())),
-            Token::Unknown(c) => Err(ParseError::UnexpectedToken(
-                Token::Unknown(c),
-                "valid expression".to_string()
-            )),
-            token => Err(ParseError::UnexpectedToken(token, "expression".to_string())),
+            }
+            if let Some(op) = found {
+                self.advance();
+                let rhs = self.parse_binary(prec+1)?;
+                lhs = Expr::Binary { op, left: Box::new(lhs), right: Box::new(rhs) };
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr> {
+        if let Token::Operator(ref s) = self.peek() {
+            // prefix ++/--
+            if s == "++" {
+                self.advance();
+                let ex = Box::new(self.parse_unary()?);
+                return Ok(Expr::Unary { op: UnaryOp::PreInc, expr: ex });
+            }
+            if s == "--" {
+                self.advance();
+                let ex = Box::new(self.parse_unary()?);
+                return Ok(Expr::Unary { op: UnaryOp::PreDec, expr: ex });
+            }
+            // other unary
+            if let Some(op) = match s.as_str() {
+                "+" => Some(UnaryOp::Plus),
+                "-" => Some(UnaryOp::Minus),
+                "!" => Some(UnaryOp::Not),
+                "~" => Some(UnaryOp::BitNot),
+                "*" => Some(UnaryOp::Deref),
+                "&" => Some(UnaryOp::Addr),
+                _ => None,
+            } {
+                self.advance();
+                let ex = Box::new(self.parse_unary()?);
+                return Ok(Expr::Unary { op, expr: ex });
+            }
+        }
+        self.parse_postfix()
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr> {
+        let mut e = match self.peek() {
+            Token::Num(n)               => { self.advance(); Expr::Num(n) },
+            Token::CharLiteral(c)       => { self.advance(); Expr::Char(c as i64) },
+            Token::StringLiteral(ref s) => { let s2 = s.clone(); self.advance(); Expr::Str(s2) },
+            Token::Id(ref id)           => { let i = id.clone(); self.advance(); Expr::Ident(i) },
+            Token::Keyword(ref k) if k == "sizeof" => {
+                self.advance(); self.expect_op("(")?;
+                let t = self.parse_type()?; self.expect_op(")")?;
+                Expr::SizeOf(t)
+            }
+            Token::Operator(ref s) if s == "(" => {
+                self.advance();
+                if let Token::Keyword(ref k) = self.peek() {
+                    if k=="char"||k=="int"||k=="void" {
+                        let mut ty = self.parse_type()?;
+                        while self.peek()==Token::Operator("*".into()) {
+                            self.advance(); ty = Type::Ptr(Box::new(ty));
+                        }
+                        self.expect_op(")")?;
+                        let sub = self.parse_unary()?;
+                        Expr::Cast { to: ty, expr: Box::new(sub) }
+                    } else {
+                        let ex = self.parse_expr()?; self.expect_op(")")?; ex
+                    }
+                } else {
+                    let ex = self.parse_expr()?; self.expect_op(")")?; ex
+                }
+            }
+            _ => return Err(Error::Syntax(format!("Unexpected primary {:?}", self.peek()))),
+        };
+
+        loop {
+            if self.peek()==Token::Operator("(".into()) {
+                self.advance();
+                let mut args = Vec::new();
+                while self.peek()!=Token::Operator(")".into()) {
+                    args.push(self.parse_expr()?);
+                    if self.peek()==Token::Operator(",".into()) { self.advance(); }
+                }
+                self.expect_op(")")?;
+                e = Expr::Call { func: Box::new(e), args };
+            } else if self.peek()==Token::Operator("[".into()) {
+                self.advance();
+                let idx = self.parse_expr()?;
+                self.expect_op("]")?;
+                e = Expr::Index { base: Box::new(e), idx: Box::new(idx) };
+            } else if self.peek()==Token::Operator("++".into()) {
+                self.advance();
+                e = Expr::Unary { op: UnaryOp::PostInc, expr: Box::new(e) };
+            } else if self.peek()==Token::Operator("--".into()) {
+                self.advance();
+                e = Expr::Unary { op: UnaryOp::PostDec, expr: Box::new(e) };
+            } else {
+                break;
+            }
+        }
+        Ok(e)
+    }
+
+    fn parse_type(&mut self) -> Result<Type> {
+        if let Token::Keyword(ref k) = self.peek() {
+            match k.as_str() {
+                "char" => { self.advance(); return Ok(Type::Char) }
+                "int"  => { self.advance(); return Ok(Type::Int) }
+                "void" => { self.advance(); return Ok(Type::Void) }
+                _ => {}
+            }
+        }
+        Err(Error::Syntax(format!("Expected type, found {:?}", self.peek())))
+    }
+
+    #[inline] fn peek(&self)   -> Token { self.tokens.get(self.pos).cloned().unwrap_or(Token::EOF) }
+    #[inline] fn advance(&mut self) { if self.pos < self.tokens.len() { self.pos += 1; }}
+
+    fn expect_op(&mut self, op: &str) -> Result<()> {
+        if self.peek()==Token::Operator(op.into()) {
+            self.advance(); Ok(())
+        } else {
+            Err(Error::Syntax(format!("Expected '{}', found {:?}", op, self.peek())))
         }
     }
 
-    fn expect_keyword(&mut self, kw: &str) -> ParseResult<()> {
-        match self.next_token() {
-            Token::Keyword(s) if s == kw => Ok(()),
-            Token::EOF => Err(ParseError::UnexpectedEOF(kw.to_string())),
-            other => Err(ParseError::UnexpectedToken(other, kw.to_string())),
+    fn consume_ident(&mut self) -> Result<String> {
+        if let Token::Id(ref s)=self.peek() {
+            let i=s.clone(); self.advance(); Ok(i)
+        } else {
+            Err(Error::Syntax(format!("Expected identifier, found {:?}", self.peek())))
         }
     }
 
-    fn peek(&self) -> Token {
-        self.tokens.get(self.pos).cloned().unwrap_or(Token::EOF)
+    fn consume_keyword(&mut self, kw: &str) -> Result<()> {
+        if let Token::Keyword(ref k)=self.peek() {
+            if k==kw { self.advance(); return Ok(()) }
+        }
+        Err(Error::Syntax(format!("Expected keyword '{}', found {:?}", kw, self.peek())))
     }
-
-    fn next_token(&mut self) -> Token {
-        let t = self.peek();
-        self.pos += 1;
-        t
-    }
-}
-
-// Modified parse_control_flow function
-pub fn parse_control_flow(tokens: Vec<Token>) -> Result<ASTNode, ParseError> {
-    let mut parser = Parser::new(tokens);
-    parser.parse_program()
 }
