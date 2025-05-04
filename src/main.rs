@@ -1,33 +1,35 @@
+// src/main.rs
+
 mod lexer;
 mod parser;
 mod vm;
 use std::env;
 use std::fs;
-
-use std::io::{self, Read};
+use std::io::{self, Write}; // Remove unused Read import
 use std::process;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     
-    let input = if args.len() > 1 {
-        // Read from file
-        match fs::read_to_string(&args[1]) {
-            Ok(content) => content,
-            Err(e) => {
-                eprintln!("Error reading file '{}': {}", args[1], e);
-                process::exit(1);
-            }
-        }
-    } else {
-        // Read from stdin
-        let mut input = String::new();
-        match io::stdin().read_to_string(&mut input) {
-            Ok(_) => input,
-            Err(e) => {
-                eprintln!("Error reading from stdin: {}", e);
-                process::exit(1);
-            }
+    // Check for debug flag
+    let debug = args.iter().any(|arg| arg == "-d");
+    
+    // Find the input file (first non-flag argument after program name)
+    let input_path = args.iter()
+        .skip(1) // Skip program name
+        .find(|arg| !arg.starts_with("-"))
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!("Usage: {} [-d] <inputfile>", args[0]);
+            process::exit(1);
+        });
+    
+    // Read from file
+    let input = match fs::read_to_string(&input_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Error reading file '{}': {}", input_path, e);
+            process::exit(1);
         }
     };
     
@@ -36,16 +38,29 @@ fn main() {
     
     // Tokenize input
     let tokens = lexer.tokenize();
+    if debug {
+        println!("Tokens: {:?}", tokens);
+    }
     
     // Parse tokens into AST
     match parser::parse_control_flow(tokens) {
         Ok(ast) => {
-            // Initialize the VM
-            let mut vm = vm::VM::new();
+            if debug {
+                println!("Successfully parsed AST");
+            }
+            
+            // Initialize the VM with debug mode if specified
+            let mut vm = if debug {
+                vm::VM::with_debug(true)
+            } else {
+                vm::VM::new()
+            };
             
             // Run the AST
             match vm.run(ast) {
-                Ok(_) => {},
+                Ok(_) => {
+                    io::stdout().flush().unwrap(); // Make sure to flush stdout
+                },
                 Err(e) => {
                     eprintln!("Runtime error: {}", e);
                     process::exit(1);

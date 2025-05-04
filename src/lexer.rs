@@ -1,16 +1,19 @@
 // lexer.rs
+#![allow(dead_code)]  // Add this line to suppress warnings about unused code
 
-// Define the different types of tokens we can find
+// Add the Number variant to Token enum
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
-    Num(i64),           // Number literals (e.g., 123, 0xFF)
-    Id(String),         // Identifiers (e.g., variable names)
-    Keyword(String),    // Keywords (e.g., int, return)
-    Operator(String),   // Operators (e.g., +, ==, &&)
-    CharLiteral(char),  // Character literals (e.g., 'a')
-    StringLiteral(String), // String literals (e.g., "hello")
-    EOF,                // End of file/input
-    Unknown(char),      // Anything we don't recognize
+    Id(String),
+    Operator(String),
+    Num(i64),
+    Keyword(String),
+    CharLiteral(char),
+    StringLiteral(String),
+    EOF,
+    Unknown(char),
+    // Add any other variants needed
 }
 
 // Lexer struct to manage the input and current position
@@ -65,7 +68,8 @@ impl Lexer {
                             // Check if it's a known keyword
                             "char" | "else" | "enum" | "if" | "int" | "return" |
                             "sizeof" | "while" | "for" | "open" | "read" | "close" | 
-                            "printf" | "malloc" | "free" | "memset" | "memcmp" | 
+                            // Removed printf from keyword list so it's treated as a normal function
+                            "malloc" | "free" | "memset" | "memcmp" | 
                             "exit" | "void"  => Token::Keyword(ident),
                             _ => Token::Id(ident),
                         }
@@ -272,6 +276,8 @@ impl Lexer {
             }
         }
 
+        // Add debugging for unterminated strings
+        println!("WARNING: Unterminated string literal: {:?}", s);
         Token::Unknown('"') // unterminated string
     }
     /// Tokenizes the entire input and returns a vector of tokens.
@@ -289,4 +295,56 @@ impl Lexer {
 
         tokens
     }
+}
+
+pub fn tokenize(input: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    // Simple tokenization implementation
+    // This should be expanded as needed
+    
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            // Skip whitespace
+            c if c.is_whitespace() => { chars.next(); },
+            
+            // Parse identifiers
+            c if c.is_alphabetic() || c == '_' => {
+                let mut id = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_alphanumeric() || c == '_' {
+                        id.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(Token::Id(id));
+            },
+            
+            // Parse numbers
+            c if c.is_digit(10) => {
+                let mut num = 0;
+                while let Some(&c) = chars.peek() {
+                    if c.is_digit(10) {
+                        num = num * 10 + c.to_digit(10).unwrap() as i64;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(Token::Num(num as i64));
+            },
+            
+            // Parse operators
+            '+' | '-' | '*' | '/' | '=' | '<' | '>' | '(' | ')' | '{' | '}' | ';' => {
+                tokens.push(Token::Operator(c.to_string()));
+                chars.next();
+            },
+            
+            // Other characters are treated as unknown/skipped
+            _ => { chars.next(); }
+        }
+    }
+    
+    tokens
 }

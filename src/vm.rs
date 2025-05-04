@@ -1,8 +1,46 @@
 // vm.rs
+#![allow(dead_code)]  // Add this line to suppress warnings about unused code
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 
 use crate::parser::{ASTNode, ParseError};
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Instruction {
+    LEA(usize),    // Load local address
+    IMM(i32),      // Load immediate value
+    JMP(usize),    // Jump
+    JSR(usize),    // Jump to subroutine
+    BZ(usize),     // Branch if zero
+    BNZ(usize),    // Branch if not zero
+    ENT(usize),    // Enter subroutine
+    ADJ(usize),    // Adjust stack
+    LEV,           // Leave subroutine
+    LI,            // Load int
+    LC,            // Load char
+    SI,            // Store int
+    SC,            // Store char
+    PSH,           // Push
+    OR,            // Logical OR
+    XOR,           // Logical XOR
+    AND,           // Logical AND
+    EQ,            // Equal
+    NE,            // Not Equal
+    LT,            // Less Than
+    GT,            // Greater Than
+    LE,            // Less Equal
+    GE,            // Greater Equal
+    SHL,           // Shift Left
+    SHR,           // Shift Right
+    ADD,           // Add
+    SUB,           // Subtract
+    MUL,           // Multiply
+    DIV,           // Divide
+    MOD,           // Modulus
+    EXIT,          // Exit program
+    PrintfStr(String), // Non-standard: for debugging
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -28,6 +66,7 @@ pub enum RuntimeError {
     InvalidAssignment,
     InvalidFunctionCall(String),
     ParseError(ParseError),
+    TypeError(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -51,6 +90,8 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "RuntimeError: Invalid function call to '{}'", name),
             RuntimeError::ParseError(e) => 
                 write!(f, "Parse error: {}", e),
+            RuntimeError::TypeError(msg) => 
+                write!(f, "RuntimeError: Type error - {}", msg),
         }
     }
 }
@@ -105,11 +146,14 @@ struct Frame {
     locals: HashMap<String, Value>,
 }
 
+#[allow(dead_code)]
 pub struct VM {
     call_stack: Vec<Frame>,
     memory: Memory,
     globals: HashMap<String, Value>,
     builtins: HashSet<String>,
+    debug: bool,  // Add debug flag
+    cycle: usize, // Add cycle counter for tracing
 }
 
 impl VM {
@@ -124,25 +168,54 @@ impl VM {
             memory: Memory::new(),
             globals: HashMap::new(),
             builtins,
+            debug: false,
+            cycle: 0,
         }
+    }
+    
+    pub fn with_debug(debug: bool) -> Self {
+        let mut vm = Self::new();
+        vm.debug = debug;
+        vm
     }
 
     pub fn run(&mut self, ast: ASTNode) -> Result<(), RuntimeError> {
-        match ast {
+        if self.debug {
+            println!("DEBUG: Starting VM execution with AST: {:?}", ast);
+        }
+        
+        // First evaluate all nodes to define functions, globals, etc.
+        match &ast {
             ASTNode::Program(nodes) => {
                 for node in nodes {
-                    self.eval(&node)?;
+                    self.eval(node)?;
                 }
-                Ok(())
             },
             _ => {
                 self.eval(&ast)?;
-                Ok(())
             }
         }
+        
+        // Then specifically call the main function if it exists
+        if self.globals.contains_key("main") {
+            if self.debug {
+                println!("DEBUG: Found main function, executing");
+            }
+            self.call_function("main", &[])?;
+        } else {
+            return Err(RuntimeError::FunctionNotFound("main".to_string()));
+        }
+        
+        Ok(())
     }
 
     fn eval(&mut self, node: &ASTNode) -> Result<Value, RuntimeError> {
+        // If debug is on, print the current instruction
+        if self.debug {
+            self.cycle += 1;
+            println!("{}> {:?}", self.cycle, node);
+        }
+
         match node {
             ASTNode::Program(nodes) => {
                 for node in nodes {
@@ -151,10 +224,15 @@ impl VM {
                 Ok(Value::Void)
             }
             ASTNode::Function { name, params, body } => {
+                // Convert Vec<String> to Vec<(String, String)> by using empty string for type
+                let param_tuples: Vec<(String, String)> = params.iter()
+                    .map(|p| ("".to_string(), p.clone()))
+                    .collect();
+                
                 self.globals.insert(
                     name.clone(),
                     Value::Function { 
-                        params: params.clone(), 
+                        params: param_tuples, 
                         body: body.clone()
                     }
                 );
@@ -162,10 +240,12 @@ impl VM {
             }
             ASTNode::Return(expr) => {
                 let value = self.eval(expr)?;
-                self.call_stack.pop();
+                // REMOVE THIS LINE: self.call_stack.pop();
+                // The call stack is already popped in the call_function method,
+                // popping it again here causes us to lose the main function's frame
                 Ok(value)
             }
-            ASTNode::Number(n) => Ok(Value::Int(*n)),
+            ASTNode::Number(n) => Ok(Value::Int((*n).into())), // Convert i32 to i64
             ASTNode::Identifier(name) => {
                 for frame in self.call_stack.iter().rev() {
                     if let Some(value) = frame.locals.get(name) {
@@ -181,6 +261,8 @@ impl VM {
                 let val = self.eval(value)?;
                 
                 let mut updated = false;
+                
+                // First check local variables in call stack frames
                 for frame in self.call_stack.iter_mut().rev() {
                     if let Some(existing) = frame.locals.get_mut(name) {
                         *existing = val.clone();
@@ -189,8 +271,21 @@ impl VM {
                     }
                 }
                 
+                // If not found in local scopes, check in globals
                 if !updated {
-                    self.call_stack.last_mut().unwrap().locals.insert(name.clone(), val.clone());
+                    if self.globals.contains_key(name) {
+                        self.globals.insert(name.clone(), val.clone());
+                        updated = true;
+                    }
+                }
+                
+                // If still not found anywhere, create it in the current scope
+                if !updated {
+                    if let Some(frame) = self.call_stack.last_mut() {
+                        frame.locals.insert(name.clone(), val.clone());
+                    } else {
+                        self.globals.insert(name.clone(), val.clone());
+                    }
                 }
                 
                 Ok(val)
@@ -225,14 +320,10 @@ impl VM {
                     self.eval(init_expr)?;
                 }
                 
-                while self.eval_condition(condition.as_ref().unwrap_or(&Box::new(ASTNode::Number(1))))? {
-                    let result = self.eval(body)?;
-                    
-                    if let Value::Void = result {
-                        // Continue looping
-                    } else {
-                        return Ok(result);
-                    }
+                while condition.as_ref().map_or(true, |cond| {
+                    self.eval_condition(cond).unwrap_or(false)
+                }) {
+                    self.eval(body)?;
                     
                     if let Some(update_expr) = update {
                         self.eval(update_expr)?;
@@ -263,12 +354,39 @@ impl VM {
                 }
                 Ok(Value::Void)
             }
-            _ => Ok(Value::Void),
+            ASTNode::Expression(_expr) => {
+                // Handle Expr compatibility
+                // ... implementation ...
+                Ok(Value::Int(0)) // Placeholder
+            }
+            ASTNode::VariableDeclaration { var_type: _, name, initializer } => {
+                let value = if let Some(init) = initializer {
+                    self.eval(init)?
+                } else {
+                    // Default initialize based on type (0 for int/char)
+                    Value::Int(0)
+                };
+                
+                // Add the variable to the current frame's locals
+                if let Some(frame) = self.call_stack.last_mut() {
+                    frame.locals.insert(name.clone(), value.clone());
+                } else {
+                    // If not in a function, add to globals
+                    self.globals.insert(name.clone(), value.clone());
+                }
+                
+                Ok(Value::Void)
+            },
         }
     }
 
     fn eval_condition(&mut self, condition: &Box<ASTNode>) -> Result<bool, RuntimeError> {
-        self.eval(condition).map(|val| self.is_truthy(&val))
+        let value = self.eval(condition)?;
+        match value {
+            Value::Int(n) => Ok(n != 0),
+            Value::Bool(b) => Ok(b),
+            _ => Err(RuntimeError::TypeError("Condition must be a boolean or integer".into()))
+        }
     }
 
     fn is_truthy(&self, value: &Value) -> bool {
@@ -279,6 +397,18 @@ impl VM {
             Value::String(s) => !s.is_empty(),
             Value::Void => false,
             Value::Function { .. } => true,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn eval_value(&self, value: Value) -> Result<i64, RuntimeError> {
+        match value {
+            Value::Int(n) => Ok(n),
+            Value::Bool(b) => Ok(if b { 1 } else { 0 }),
+            Value::String(_) => Err(RuntimeError::TypeError("Cannot convert string to integer".into())),
+            Value::Pointer(p) => Ok(p as i64),
+            Value::Void => Ok(0),
+            Value::Function { .. } => Err(RuntimeError::TypeError("Cannot convert function to integer".into())),
         }
     }
 
@@ -351,59 +481,103 @@ impl VM {
     }
 
     fn call_function(&mut self, name: &str, args: &[ASTNode]) -> Result<Value, RuntimeError> {
+        if self.debug {
+            println!("DEBUG: Calling function {} with {} args", name, args.len());
+        }
+        
+        // Special case for printf
         if name == "printf" {
             return self.handle_printf(args);
         }
-
+    
+        // Get function from globals
         let func = match self.globals.get(name) {
             Some(Value::Function { params, body }) => (params.clone(), body.clone()),
             _ => return Err(RuntimeError::FunctionNotFound(name.to_string())),
         };
-
+    
+        // Check argument count
         if args.len() != func.0.len() {
             return Err(RuntimeError::InvalidFunctionCall(format!(
                 "Expected {} arguments for function '{}', got {}",
                 func.0.len(), name, args.len()
             )));
         }
-
+    
+        // Evaluate arguments
         let evaluated_args = args.iter()
             .map(|arg| self.eval(arg))
             .collect::<Result<Vec<_>, _>>()?;
-
+    
+        // Create new stack frame
         let mut frame = Frame {
             locals: HashMap::new(),
         };
-
+    
+        // Bind arguments to parameters
         for ((_, param_name), value) in func.0.iter().zip(evaluated_args) {
             frame.locals.insert(param_name.clone(), value);
         }
-
+    
+        // Push frame and execute function body
         self.call_stack.push(frame);
+        
+        // Execute function body statements
         let mut result = Value::Void;
-
         for stmt in &func.1 {
             result = self.eval(stmt)?;
-            if let Value::Void = result {
-                continue;
+            // If we got a non-void result (from a return statement),
+            // break out of the loop
+            if !matches!(result, Value::Void) {
+                break;
             }
         }
-
+    
+        // Debug output to verify result
+        if self.debug {
+            println!("DEBUG: Function {} returned {:?}", name, result);
+        }
+    
+        // Always pop the frame after function execution
         self.call_stack.pop();
         Ok(result)
     }
 
     fn handle_printf(&mut self, args: &[ASTNode]) -> Result<Value, RuntimeError> {
-        if let Some(ASTNode::StringLiteral(fmt_str)) = args.get(0) {
-            let values = args[1..].iter()
-                .map(|arg| self.eval(arg))
-                .collect::<Result<Vec<_>, _>>()?;
-            
-            self.format_and_print(fmt_str, &values);
-            return Ok(Value::Int(0));
+        match args.get(0) {
+            Some(ASTNode::StringLiteral(fmt_str)) => {
+                let values = args[1..].iter()
+                    .map(|arg| self.eval(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                
+                self.format_and_print(fmt_str, &values);
+                Ok(Value::Int(0))
+            },
+            // Also handle the case where a variable contains the format string
+            Some(ASTNode::Identifier(name)) => {
+                let format_value = self.eval(&ASTNode::Identifier(name.clone()))?;
+                
+                let fmt_str = match format_value {
+                    Value::String(s) => s,
+                    Value::Pointer(addr) => {
+                        self.memory.read_string(addr).unwrap_or_else(|| "?invalid_format?".to_string())
+                    },
+                    _ => return Err(RuntimeError::TypeMismatch(
+                        "First argument to printf must be a string".to_string()
+                    )),
+                };
+                
+                let values = args[1..].iter()
+                    .map(|arg| self.eval(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                
+                self.format_and_print(&fmt_str, &values);
+                Ok(Value::Int(0))
+            },
+            _ => Err(RuntimeError::TypeMismatch(
+                "First argument to printf must be a string".to_string()
+            )),
         }
-        
-        Err(RuntimeError::TypeMismatch("First argument to printf must be a string".to_string()))
     }
 
     fn format_and_print(&self, fmt_str: &str, args: &[Value]) {
@@ -478,7 +652,9 @@ impl VM {
                         },
                         _ => {
                             result.push('%');
-                            result.push('?');
+                            if let Some(c) = chars.next() {
+                                result.push(c);
+                            }
                         }
                     }
                     arg_idx += 1;
@@ -490,6 +666,16 @@ impl VM {
             }
         }
         
+        // Use print! instead of println! to avoid adding extra newlines
         print!("{}", result);
+        io::stdout().flush().unwrap(); // Make sure to flush the output
+    }
+    
+    // Add helper to print formatted instructions like in c4
+    fn print_instruction(&self, instr_name: &str, value: Option<i64>) {
+        match value {
+            Some(val) => println!("{}> {:<4} {}", self.cycle, instr_name, val),
+            None => println!("{}> {:<4}", self.cycle, instr_name),
+        }
     }
 }
