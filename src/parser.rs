@@ -124,7 +124,7 @@ impl Parser {
         if self.next_token() != Token::Operator("(".into()) {
             return Err(ParseError::MissingParenthesis);
         }
-        // *New Check*: Detect missing closing ')' if next token is '{'
+        // New Check: Detect missing closing ')' if next token is '{'
         if self.peek() == Token::Operator("{".into()) {
             return Err(ParseError::MissingParenthesis);
         }
